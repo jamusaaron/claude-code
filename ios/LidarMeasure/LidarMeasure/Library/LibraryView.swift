@@ -19,6 +19,8 @@ struct LibraryView: View {
     @State private var search = ""
     @State private var shareItem: ShareItem?
     @State private var errorMessage: String?
+    @State private var missingModels: [SavedModel] = []
+    @State private var recoveredCount = 0
 
     var body: some View {
         NavigationStack {
@@ -38,6 +40,7 @@ struct LibraryView: View {
                 .background(.bar)
             }
             .navigationTitle("Library")
+            .task { reconcileModels() }
             .searchable(text: $search, prompt: segment == .measurements ? "Search measurements" : "Search models")
             .toolbar {
                 if segment == .measurements {
@@ -86,7 +89,8 @@ struct LibraryView: View {
                     }
                 }
                 .onDelete { offsets in
-                    for i in offsets { modelContext.delete(filteredMeasurements[i]) }
+                    let rows = filteredMeasurements
+                    for i in offsets { modelContext.delete(rows[i]) }
                     try? modelContext.save()
                 }
             }
@@ -115,6 +119,11 @@ struct LibraryView: View {
         return models.filter { $0.name.localizedCaseInsensitiveContains(search) }
     }
 
+    /// Models with files on disk (missing ones are listed separately).
+    private var visibleModels: [SavedModel] {
+        filteredModels.filter { m in !missingModels.contains { $0.id == m.id } }
+    }
+
     @ViewBuilder private var modelList: some View {
         if models.isEmpty {
             ContentUnavailableView {
@@ -126,7 +135,29 @@ struct LibraryView: View {
             ContentUnavailableView.search(text: search)
         } else {
             List {
-                ForEach(filteredModels) { model in
+                if recoveredCount > 0 {
+                    Label("Recovered \(recoveredCount) model(s) whose library entry was missing.", systemImage: "arrow.clockwise.circle")
+                        .font(.footnote)
+                        .foregroundStyle(Theme.good)
+                }
+                if !missingModels.isEmpty {
+                    Section {
+                        ForEach(missingModels) { model in
+                            HStack {
+                                Label(model.name, systemImage: "exclamationmark.triangle")
+                                    .foregroundStyle(Theme.fair)
+                                Spacer()
+                                Button("Remove", role: .destructive) { removeMissing(model) }
+                                    .buttonStyle(.borderless)
+                            }
+                        }
+                    } header: {
+                        Text("Files missing")
+                    } footer: {
+                        Text("These entries' model files are no longer on this device.")
+                    }
+                }
+                ForEach(visibleModels) { model in
                     NavigationLink {
                         ModelViewerView(title: model.name, folder: model.folderURL, stats: ModelStore.readMeta(model.folderURL)?.stats)
                     } label: {
@@ -139,8 +170,9 @@ struct LibraryView: View {
                     }
                 }
                 .onDelete { offsets in
+                    let rows = visibleModels
                     for i in offsets {
-                        let model = filteredModels[i]
+                        let model = rows[i]
                         ModelStore.delete(folderName: model.folderName)
                         modelContext.delete(model)
                     }
@@ -148,6 +180,18 @@ struct LibraryView: View {
                 }
             }
         }
+    }
+
+    private func reconcileModels() {
+        let result = ModelStore.reconcile(known: models, context: modelContext)
+        recoveredCount = result.recovered
+        missingModels = result.missing
+    }
+
+    private func removeMissing(_ model: SavedModel) {
+        modelContext.delete(model)
+        try? modelContext.save()
+        missingModels.removeAll { $0.id == model.id }
     }
 
     private func share(_ model: SavedModel, _ format: ModelStore.ExportFormat) {

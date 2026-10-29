@@ -44,10 +44,20 @@ struct SnapOptions {
 /// On top of that the point may be refined: projected onto a detected plane when it agrees with
 /// the surface (a plane is fitted to hundreds of samples, so it is steadier than any single hit),
 /// or moved onto a fitted edge line or corner (see `SnapGeometry`).
+///
+/// Every candidate must also be *supported*: a point is only accepted if the LiDAR depth
+/// under the pixel agrees with it, or reconstructed mesh exists right there. AR ray casts can
+/// otherwise invent surfaces (an estimated plane through thin air, or a room plane behind the
+/// object you are aiming at), and an unsupported number is worse than none.
 @MainActor
 final class SurfaceResolver {
     private let arView: ARView
     let meshIndex = MeshSnapIndex()
+
+    /// The LiDAR can't resolve depth closer than this.
+    static let minimumRange: Float = 0.15
+    /// Beyond this, only points on already reconstructed geometry are accepted.
+    static let reliableRange = Float(AccuracyModel.reliableRange)
 
     init(arView: ARView) {
         self.arView = arView
@@ -110,8 +120,32 @@ final class SurfaceResolver {
 
         guard let surface = base else { return nil }
 
-        // 4. Edge / corner refinement on the LiDAR mesh.
-        if options.edges, surface.snap != .estimatedPlane, let anchors = meshAnchors(frame), !anchors.isEmpty {
+        // 4. Support and range checks.
+        let range = simd_distance(surface.position, cameraPosition)
+        guard range >= Self.minimumRange else { return nil }
+        let reconstructed: Set<SnapKind> = [.mesh, .plane]
+        guard range <= Self.reliableRange || reconstructed.contains(surface.snap) else { return nil }
+
+        var downgraded = false
+        switch depthAgreement(surface.position, sample: depth, frame: frame) {
+        case .agrees:
+            break
+        case .disagrees:
+            // The LiDAR sees a different surface at this pixel. An estimated or detected plane
+            // is then usually the wall behind the object being aimed at: reject it. A mesh hit
+            // is real reconstructed geometry that may lag the scene (something moved), so keep
+            // it but trust it less.
+            if surface.snap != .mesh { return nil }
+            downgraded = true
+        case .unknown:
+            // No usable depth here: only accept points sitting on reconstructed mesh.
+            if surface.snap == .estimatedPlane || surface.snap == .depth {
+                guard hasMeshSupport(near: surface.position, frame: frame) else { return nil }
+            }
+        }
+
+        // 5. Edge / corner refinement on the LiDAR mesh (not on a point we already distrust).
+        if options.edges, !downgraded, surface.snap != .estimatedPlane, let anchors = meshAnchors(frame), !anchors.isEmpty {
             let range = simd_distance(surface.position, cameraPosition)
             let radius = min(0.06, max(0.025, 0.015 * range))
             let triangles = meshIndex.triangles(near: surface.position, radius: radius, anchors: anchors)
@@ -126,7 +160,39 @@ final class SurfaceResolver {
             }
         }
 
-        return finish(surface.position, normal: surface.normal, snap: surface.snap)
+        let result = finish(surface.position, normal: surface.normal, snap: surface.snap)
+        return downgraded ? lowered(result, tracking: tracking) : result
+    }
+
+    // MARK: Support checks
+
+    enum DepthAgreement: Equatable {
+        case agrees, disagrees, unknown
+    }
+
+    /// Compares the candidate's distance along the camera axis with the LiDAR depth under the
+    /// pixel. Tolerance max(5 cm, 4%) covers sensor noise without accepting a different surface.
+    func depthAgreement(_ point: SIMD3<Float>, sample: DepthSample?, frame: ARFrame) -> DepthAgreement {
+        guard let sample, sample.validFraction > 0.3, sample.confidence != .low else { return .unknown }
+        let local = frame.camera.transform.inverse * SIMD4<Float>(point, 1)
+        let expected = -local.z
+        guard expected > 0 else { return .disagrees }
+        return abs(sample.depth - expected) <= max(0.05, 0.04 * expected) ? .agrees : .disagrees
+    }
+
+    /// Reconstructed LiDAR mesh within 4 cm of the point.
+    func hasMeshSupport(near point: SIMD3<Float>, frame: ARFrame) -> Bool {
+        guard let anchors = meshAnchors(frame) else { return false }
+        return !meshIndex.triangles(near: point, radius: 0.04, anchors: anchors, limit: 1).isEmpty
+    }
+
+    /// One confidence level lower, with the uncertainty recomputed to match.
+    private func lowered(_ r: ResolvedPoint, tracking: TrackingQuality) -> ResolvedPoint {
+        var out = r
+        out.confidence = DepthConfidence(rawValue: max(0, r.confidence.rawValue - 1)) ?? .low
+        out.sigma = AccuracyModel.pointSigma(range: Double(r.range), confidence: out.confidence, snap: r.snap, tracking: tracking)
+        out.nearDepthEdge = true
+        return out
     }
 
     /// Screen position of a world point, nil if behind the camera or off-screen.

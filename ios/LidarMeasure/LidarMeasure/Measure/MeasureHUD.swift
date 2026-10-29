@@ -80,6 +80,11 @@ struct ReadoutCard: View {
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.white.opacity(0.7))
             }
+            if readout != nil {
+                Text("Estimate · verify critical dimensions with a tape or laser measure")
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.6))
+            }
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)

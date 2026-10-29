@@ -82,10 +82,17 @@ public struct TextureProjectionOptions: Sendable, Equatable {
     public var maxAtlasDimension: Int
     /// Height of the neutral grey strip used by faces no keyframe saw.
     public var gutterHeight: Int
+    /// Views farther than this are ignored: LiDAR depth (and so the occlusion test) is
+    /// unreliable beyond ~5 m and the texture would be blurry anyway.
+    public var maxViewDistance: Double
+    /// Score multiplier for a view whose depth at the face could not be checked
+    /// (low-confidence or missing LiDAR). Verified views win whenever one exists.
+    public var unverifiedPenalty: Double
 
     public init(maxKeyframes: Int = 16, minimumCosine: Double = 0.2, edgeMargin: Double = 8,
                 occlusionTolerance: Double = 0.04, occlusionRelativeTolerance: Double = 0.03,
-                maxAtlasDimension: Int = 4096, gutterHeight: Int = 8) {
+                maxAtlasDimension: Int = 4096, gutterHeight: Int = 8,
+                maxViewDistance: Double = 5, unverifiedPenalty: Double = 0.25) {
         self.maxKeyframes = maxKeyframes
         self.minimumCosine = minimumCosine
         self.edgeMargin = edgeMargin
@@ -93,6 +100,8 @@ public struct TextureProjectionOptions: Sendable, Equatable {
         self.occlusionRelativeTolerance = occlusionRelativeTolerance
         self.maxAtlasDimension = maxAtlasDimension
         self.gutterHeight = gutterHeight
+        self.maxViewDistance = maxViewDistance
+        self.unverifiedPenalty = unverifiedPenalty
     }
 }
 
@@ -209,7 +218,7 @@ public enum TextureProjector {
             for (f, kf) in keyframes.enumerated() {
                 let toCamera = cameraCentres[f] - centroid
                 let distance = Vec.length(toCamera)
-                guard distance > 0.05 else { continue }
+                guard distance > 0.05, distance <= options.maxViewDistance else { continue }
                 let cosine = Vec.dot(n, toCamera) / distance
                 guard cosine >= options.minimumCosine else { continue }
 
@@ -223,18 +232,28 @@ public enum TextureProjector {
                       inside(pcc.u, pcc.v, kf.intrinsics, margin: options.edgeMargin)
                 else { continue }
 
-                // Occlusion: the keyframe's own LiDAR depth must not be clearly nearer.
-                if let depth = kf.depth,
-                   let measured = depth.value(atNormalized: pc.u / Double(kf.intrinsics.width), pc.v / Double(kf.intrinsics.height)) {
-                    let tolerance = max(options.occlusionTolerance, options.occlusionRelativeTolerance * pc.depth)
-                    if Double(measured) < pc.depth - tolerance { continue }
+                // Visibility against the keyframe's own LiDAR depth:
+                //  * centre: depth must agree with the face (nearer = occluded, farther = the
+                //    camera actually saw something else there, e.g. through a hole);
+                //  * corners: none may be hidden behind a nearer surface, which stops texture
+                //    from a foreground object bleeding onto the face behind it. Corners may
+                //    see background (silhouettes), so "farther" is allowed there.
+                var verified = false
+                switch depthCheck(pc, in: kf, options: options) {
+                case .agrees: verified = true
+                case .occluded, .disagrees: continue
+                case .unknown: break
                 }
+                if depthCheck(pa, in: kf, options: options) == .occluded
+                    || depthCheck(pb, in: kf, options: options) == .occluded
+                    || depthCheck(pcc, in: kf, options: options) == .occluded { continue }
 
                 // Prefer head-on, close and central views (lens edges are softer and less accurate).
                 let du = (pc.u - kf.intrinsics.cx) / Double(kf.intrinsics.width)
                 let dv = (pc.v - kf.intrinsics.cy) / Double(kf.intrinsics.height)
                 let radial = min(1, (du * du + dv * dv).squareRoot() * 2)
-                let score = cosine * cosine / max(pc.depth, 0.3) * (1 - 0.5 * radial)
+                var score = cosine * cosine / max(pc.depth, 0.3) * (1 - 0.5 * radial)
+                if !verified { score *= options.unverifiedPenalty }
                 insert(Candidate(keyframe: f, score: score), into: &top, limit: 3)
             }
             best[t] = top
@@ -335,6 +354,22 @@ public enum TextureProjector {
             cells.append(AtlasCell(keyframeID: id, x: (slot % columns) * cellW, y: (slot / columns) * cellH, width: cellW, height: cellH))
         }
         return AtlasLayout(width: columns * cellW, height: rows * cellH + options.gutterHeight, cells: cells, gutterY: rows * cellH)
+    }
+
+    enum DepthCheck: Equatable {
+        case agrees, occluded, disagrees, unknown
+    }
+
+    /// Compares the projected depth of a point with the keyframe's LiDAR depth there.
+    static func depthCheck(_ p: (u: Double, v: Double, depth: Double), in keyframe: Keyframe, options: TextureProjectionOptions) -> DepthCheck {
+        guard let depth = keyframe.depth,
+              let measured = depth.value(atNormalized: p.u / Double(keyframe.intrinsics.width), p.v / Double(keyframe.intrinsics.height))
+        else { return .unknown }
+        let tolerance = max(options.occlusionTolerance, options.occlusionRelativeTolerance * p.depth)
+        let m = Double(measured)
+        if m < p.depth - tolerance { return .occluded }
+        if m > p.depth + tolerance { return .disagrees }
+        return .agrees
     }
 
     @inline(__always) static func inside(_ u: Double, _ v: Double, _ k: CameraIntrinsics, margin: Double) -> Bool {

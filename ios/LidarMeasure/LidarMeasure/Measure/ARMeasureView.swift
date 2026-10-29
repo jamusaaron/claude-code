@@ -2,21 +2,18 @@ import SwiftUI
 import SwiftData
 import MeasureCore
 
-/// Main measuring screen: camera, reticle, live readout and floating tools.
+/// Measuring tools drawn over the shared camera (see `RootView`): reticle, live readout and
+/// floating controls.
 struct ARMeasureView: View {
-    var isActive: Bool
+    @ObservedObject var controller: MeasureController
 
     @EnvironmentObject private var settings: AppSettings
     @Environment(\.modelContext) private var modelContext
-    @StateObject private var controller = MeasureController()
     @State private var saveTarget: Measurement?
     @State private var confirmClear = false
 
     var body: some View {
         ZStack {
-            ARViewContainer(arView: controller.arView)
-                .ignoresSafeArea()
-
             if settings.showConfidenceOverlay, let image = controller.confidenceImage {
                 ConfidenceOverlay(image: image)
             }
@@ -24,7 +21,7 @@ struct ARMeasureView: View {
             // Full-screen layer so the crosshair sits exactly at the ARView's centre.
             ReticleView(resolved: controller.reticle, highContrast: settings.highContrastHUD)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .ignoresSafeArea()
+                .ignoresSafeArea(edges: .top)
 
             VStack(spacing: 10) {
                 topBar
@@ -52,14 +49,7 @@ struct ARMeasureView: View {
             .padding(.bottom, 8)
             .animation(.snappy, value: controller.toast)
         }
-        .onAppear {
-            controller.attach(settings: settings)
-            if isActive { controller.start() }
-        }
-        .onDisappear { controller.pause() }
-        .onChange(of: isActive) { _, nowActive in
-            if nowActive { controller.start() } else { controller.pause() }
-        }
+        .onAppear { controller.attach(settings: settings) }
         .onChange(of: settings.showMeshOverlay) { _, _ in controller.applyDisplaySettings() }
         .onChange(of: settings.occlusionEnabled) { _, _ in controller.applyDisplaySettings() }
         .onChange(of: settings.showConfidenceOverlay) { _, _ in controller.applyDisplaySettings() }
@@ -209,7 +199,7 @@ private struct ConfidenceOverlay: View {
                 .frame(width: geo.size.width, height: geo.size.height)
                 .clipped()
         }
-        .ignoresSafeArea()
+        .ignoresSafeArea(edges: .top)
         .allowsHitTesting(false)
     }
 }

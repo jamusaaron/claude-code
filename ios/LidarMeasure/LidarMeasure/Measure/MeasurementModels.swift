@@ -7,7 +7,11 @@ struct MeasurementPoint: Identifiable, Equatable {
     let id: UUID
     /// Identifier of the backing `ARAnchor`, nil for preview points.
     var anchorID: UUID?
-    var position: SIMD3<Float>
+    /// Where the ARAnchor is now. ARKit moves it as its world map is refined.
+    var anchorPosition: SIMD3<Float>
+    /// Small correction from re-sampling the surface as the LiDAR mesh improves. Bounded to
+    /// 2 cm so a point can settle onto the surface but never wander across it.
+    var refinement: SIMD3<Float> = .zero
     var sigma: Double
     var confidence: DepthConfidence
     var snap: SnapKind
@@ -16,12 +20,20 @@ struct MeasurementPoint: Identifiable, Equatable {
     init(id: UUID = UUID(), anchorID: UUID?, resolved: ResolvedPoint) {
         self.id = id
         self.anchorID = anchorID
-        self.position = resolved.position
+        self.anchorPosition = resolved.position
         self.sigma = resolved.sigma
         self.confidence = resolved.confidence
         self.snap = resolved.snap
         self.range = resolved.range
     }
+
+    var position: SIMD3<Float> { anchorPosition + refinement }
+
+    /// Only free-surface points are refined. Plane, edge, corner and re-used points are
+    /// already geometric fits, and re-sampling would pull them off the feature.
+    var isRefinable: Bool { anchorID != nil && (snap == .mesh || snap == .depth) }
+
+    static let maximumRefinement: Float = 0.02
 
     var measured: MeasuredPoint { MeasuredPoint(position: position.asDouble, sigma: sigma) }
 }

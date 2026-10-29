@@ -55,6 +55,8 @@ public struct MeasurementResult: Sendable, Equatable {
     public var height: Double?
     /// Distance of the worst vertex from the best-fit plane (area/volume bases).
     public var maxPlaneDeviation: Double?
+    /// Deviation that tap noise alone can explain (see `PolygonGeometry.planarityTolerance`).
+    public var planarityTolerance: Double?
     public var isSelfIntersecting: Bool
     public var segments: [SegmentResult]
     /// Where to draw the main label.
@@ -64,8 +66,11 @@ public struct MeasurementResult: Sendable, Equatable {
     public var caveats: [String] {
         var out: [String] = []
         if isSelfIntersecting { out.append("Edges cross: the area of a self-intersecting outline is not meaningful.") }
-        if let dev = maxPlaneDeviation, let p = perimeter, dev > max(0.02, 0.02 * p) {
+        if let dev = maxPlaneDeviation, let tolerance = planarityTolerance, dev > tolerance {
             out.append("Points are not on one flat surface (up to \(Int((dev * 1000).rounded())) mm off). Area is measured on the best-fit plane.")
+        }
+        if kind == .volume {
+            out.append("Prism estimate: base area × perpendicular height. Assumes the same cross-section all the way up.")
         }
         if kind == .distance, value < 0.1 { out.append("Short distance: LiDAR error is large relative to objects under ~10 cm.") }
         return out
@@ -87,6 +92,7 @@ public enum MeasurementCalculator {
             area: nil,
             height: nil,
             maxPlaneDeviation: nil,
+            planarityTolerance: nil,
             isSelfIntersecting: false,
             segments: [SegmentResult(length: length, sigma: sigma, midpoint: mid)],
             labelAnchor: mid
@@ -116,7 +122,9 @@ public enum MeasurementCalculator {
         let sigma = AccuracyModel.polygonAreaSigma(points: positions, sigmas: polygon.map(\.sigma), area: m.area)
         let relative = m.area > 0 ? sigma / m.area : .infinity
         var grade = AccuracyModel.grade(relativeError: relative)
-        if m.isSelfIntersecting { grade = .low }
+        // A clearly non-flat outline is a projection, not the surface's real area.
+        if m.isSelfIntersecting || m.maxPlaneDeviation > 2 * m.planarityTolerance { grade = .low }
+        else if !m.isPlanar { grade = min(grade, .medium) }
         return MeasurementResult(
             kind: .area,
             value: m.area,
@@ -126,6 +134,7 @@ public enum MeasurementCalculator {
             area: m.area,
             height: nil,
             maxPlaneDeviation: m.maxPlaneDeviation,
+            planarityTolerance: m.planarityTolerance,
             isSelfIntersecting: m.isSelfIntersecting,
             segments: segments(polygon, closed: true),
             labelAnchor: m.centroid
@@ -142,8 +151,7 @@ public enum MeasurementCalculator {
         let heightSigma = (top.sigma * top.sigma + basePlaneSigma * basePlaneSigma).squareRoot()
         let sigma = AccuracyModel.prismVolumeSigma(area: prism.baseArea, areaSigma: baseResult.sigma, height: prism.height, heightSigma: heightSigma)
         let relative = prism.volume > 0 ? sigma / prism.volume : .infinity
-        var grade = AccuracyModel.grade(relativeError: relative)
-        if baseResult.isSelfIntersecting { grade = .low }
+        let grade = min(AccuracyModel.grade(relativeError: relative), baseResult.grade)
         return MeasurementResult(
             kind: .volume,
             value: prism.volume,
@@ -153,6 +161,7 @@ public enum MeasurementCalculator {
             area: prism.baseArea,
             height: prism.height,
             maxPlaneDeviation: baseResult.maxPlaneDeviation,
+            planarityTolerance: baseResult.planarityTolerance,
             isSelfIntersecting: baseResult.isSelfIntersecting,
             segments: baseResult.segments,
             labelAnchor: prism.baseCentroid + prism.baseNormal * prism.height

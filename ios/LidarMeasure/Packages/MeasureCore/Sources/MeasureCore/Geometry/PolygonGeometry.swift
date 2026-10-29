@@ -12,7 +12,29 @@ public struct PolygonMetrics: Sendable, Equatable {
     /// Largest distance from a vertex to the best-fit plane (m). Large values mean the user's
     /// points are not on one flat surface, so "area" is the area of a projection.
     public var maxPlaneDeviation: Double
+    /// Deviation LiDAR tap noise can explain: max(1 cm, 0.5% of the outline's span).
+    /// Beyond it the points are genuinely not on one flat surface.
+    public var planarityTolerance: Double
     public var isSelfIntersecting: Bool
+
+    public var isPlanar: Bool { maxPlaneDeviation <= planarityTolerance }
+}
+
+/// Why an outline can't be closed into a measurable polygon.
+public enum PolygonIssue: Error, Equatable, Sendable {
+    case tooFewPoints
+    case duplicatePoints
+    case degenerate
+    case selfIntersecting
+
+    public var message: String {
+        switch self {
+        case .tooFewPoints: return "An area needs at least three corners."
+        case .duplicatePoints: return "Two corners are at the same spot. Undo the extra point."
+        case .degenerate: return "The corners are in a line, so there is no area to measure."
+        case .selfIntersecting: return "The outline crosses itself. Tap the corners in order around the edge."
+        }
+    }
 }
 
 public enum PolygonGeometry {
@@ -61,8 +83,31 @@ public enum PolygonGeometry {
             normal: normal,
             centroid: c,
             maxPlaneDeviation: deviation,
+            planarityTolerance: planarityTolerance(points),
             isSelfIntersecting: isSelfIntersecting(flat)
         )
+    }
+
+    /// max(1 cm, 0.5% of the largest distance between any two corners).
+    public static func planarityTolerance(_ points: [Vec3]) -> Double {
+        var span = 0.0
+        for i in 0..<points.count {
+            for j in (i + 1)..<points.count { span = max(span, Vec.distance(points[i], points[j])) }
+        }
+        return max(0.01, 0.005 * span)
+    }
+
+    /// Checks an outline before it is closed. Crossing, touching, duplicate and collinear
+    /// outlines are refused rather than turned into a misleading number.
+    public static func validate(_ points: [Vec3], minimumSpacing: Double = 0.001, minimumArea: Double = 1e-6) -> PolygonIssue? {
+        guard points.count >= 3 else { return .tooFewPoints }
+        for i in 0..<points.count {
+            for j in (i + 1)..<points.count where Vec.distance(points[i], points[j]) < minimumSpacing {
+                return .duplicatePoints
+            }
+        }
+        guard let m = metrics(points), m.area >= minimumArea else { return .degenerate }
+        return m.isSelfIntersecting ? .selfIntersecting : nil
     }
 
     /// Orthonormal in-plane basis (u, v) with u × v == normal.
@@ -106,11 +151,21 @@ public enum PolygonGeometry {
         return false
     }
 
-    static func segmentsIntersect(_ p1: Vec2, _ p2: Vec2, _ q1: Vec2, _ q2: Vec2) -> Bool {
+    /// Proper crossings, plus a vertex touching or overlapping the other segment.
+    static func segmentsIntersect(_ p1: Vec2, _ p2: Vec2, _ q1: Vec2, _ q2: Vec2, epsilon: Double = 1e-10) -> Bool {
         func orient(_ a: Vec2, _ b: Vec2, _ c: Vec2) -> Double { Vec.cross(b - a, c - a) }
+        func onSegment(_ a: Vec2, _ b: Vec2, _ p: Vec2) -> Bool {
+            abs(orient(a, b, p)) <= epsilon
+                && p.x >= min(a.x, b.x) - epsilon && p.x <= max(a.x, b.x) + epsilon
+                && p.y >= min(a.y, b.y) - epsilon && p.y <= max(a.y, b.y) + epsilon
+        }
         let d1 = orient(q1, q2, p1), d2 = orient(q1, q2, p2)
         let d3 = orient(p1, p2, q1), d4 = orient(p1, p2, q2)
-        return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))
+        if ((d1 > epsilon && d2 < -epsilon) || (d1 < -epsilon && d2 > epsilon))
+            && ((d3 > epsilon && d4 < -epsilon) || (d3 < -epsilon && d4 > epsilon)) {
+            return true
+        }
+        return onSegment(q1, q2, p1) || onSegment(q1, q2, p2) || onSegment(p1, p2, q1) || onSegment(p1, p2, q2)
     }
 
     /// Ear-clipping triangulation of a simple polygon (convex or concave). Returns index

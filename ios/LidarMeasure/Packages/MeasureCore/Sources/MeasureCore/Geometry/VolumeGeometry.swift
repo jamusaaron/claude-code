@@ -11,12 +11,29 @@ public struct PrismMetrics: Sendable, Equatable {
 }
 
 public struct MeshVolumeEstimate: Sendable, Equatable {
-    /// Enclosed volume between the mesh surface and the support plane (m³).
+    public enum Method: String, Codable, Sendable {
+        /// Divergence theorem over a closed, consistently oriented, single-piece mesh.
+        case closedMesh
+        /// Surface plus the support plane it rests on (open-bottomed object scans).
+        case aboveSupportPlane
+    }
+
+    /// Enclosed volume (m³).
     public var volume: Double
     /// Fraction of edge length (above the support plane) that borders a hole. 0 means closed.
     public var openness: Double
     /// Whether the estimate should be trusted at all: closed enough and positive.
     public var isReliable: Bool
+    public var method: Method = .aboveSupportPlane
+    public var topology: MeshTopology?
+
+    public init(volume: Double, openness: Double, isReliable: Bool, method: Method = .aboveSupportPlane, topology: MeshTopology? = nil) {
+        self.volume = volume
+        self.openness = openness
+        self.isReliable = isReliable
+        self.method = method
+        self.topology = topology
+    }
 }
 
 public enum VolumeGeometry {
@@ -57,6 +74,43 @@ public enum VolumeGeometry {
         let openness = boundaryOpenness(positions: positions, indices: indices, ignoreBelowY: planeY + 0.02)
         let reliable = volume > 0 && openness < 0.05
         return MeshVolumeEstimate(volume: max(0, volume), openness: openness, isReliable: reliable)
+    }
+
+    /// Volume of a closed, consistently oriented mesh: sum of signed tetrahedra from the
+    /// centroid. Only meaningful when `MeshTopology.isClosedManifold` holds.
+    public static func closedMeshVolume(positions: [Vec3f], indices: [UInt32]) -> Double {
+        guard !positions.isEmpty else { return 0 }
+        let reference = positions.reduce(Vec3.zero) { $0 + Vec.double($1) } / Double(positions.count)
+        var signed = 0.0
+        for t in 0..<(indices.count / 3) {
+            let a = Vec.double(positions[Int(indices[t * 3])]) - reference
+            let b = Vec.double(positions[Int(indices[t * 3 + 1])]) - reference
+            let c = Vec.double(positions[Int(indices[t * 3 + 2])]) - reference
+            signed += Vec.dot(a, Vec.cross(b, c)) / 6
+        }
+        return signed
+    }
+
+    /// Best available volume for a captured mesh, or nil when no estimate is defensible.
+    ///
+    /// 1. A single closed, consistently oriented manifold gets an exact enclosed volume.
+    /// 2. Otherwise, with a known support plane (object scans), the open-bottom estimate is
+    ///    used and marked reliable only if the rest of the surface is nearly closed, one
+    ///    piece and consistently oriented.
+    /// 3. Anything else (rooms, scattered pieces) gets no volume rather than a guess.
+    public static func estimateVolume(positions: [Vec3f], indices: [UInt32], supportPlaneY: Double?) -> MeshVolumeEstimate? {
+        guard indices.count >= 3 else { return nil }
+        let topology = MeshTopology.analyse(indices: indices)
+        if topology.isClosedManifold && topology.components == 1 {
+            let v = closedMeshVolume(positions: positions, indices: indices)
+            return MeshVolumeEstimate(volume: abs(v), openness: 0, isReliable: v > 0, method: .closedMesh, topology: topology)
+        }
+        guard let planeY = supportPlaneY else { return nil }
+        var estimate = meshVolumeAbovePlane(positions: positions, indices: indices, planeY: planeY)
+        estimate.topology = topology
+        estimate.isReliable = estimate.isReliable && topology.components == 1 && topology.isConsistentlyOriented
+            && topology.nonManifoldEdges == 0
+        return estimate
     }
 
     /// Share of total edge length that is on a boundary (used by exactly one triangle),

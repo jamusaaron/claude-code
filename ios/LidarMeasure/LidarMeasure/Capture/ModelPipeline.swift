@@ -82,11 +82,13 @@ enum ModelPipeline {
         guard !cleaned.isEmpty else { throw snapshot.region != nil && options.cropToRegion ? PipelineError.nothingInRegion : PipelineError.emptyMesh }
         try Task.checkCancellation()
 
-        // 2. Volume (objects only): enclosed volume above the support surface.
-        var volume: MeshVolumeEstimate?
-        if snapshot.scope == .object, let region = snapshot.region {
-            volume = VolumeGeometry.meshVolumeAbovePlane(positions: cleaned.positions, indices: cleaned.indices, planeY: region.baseY)
-        }
+        // 2. Volume: exact for a closed single-piece mesh; for object scans, the open-bottomed
+        //    surface plus the support plane; otherwise none (rooms are open by nature).
+        let volume = VolumeGeometry.estimateVolume(
+            positions: cleaned.positions,
+            indices: cleaned.indices,
+            supportPlaneY: snapshot.scope == .object ? snapshot.region?.baseY : nil
+        )
 
         // 3. Texture.
         let material = MaterialSpec.preset(options.materialPreset, customColour: options.customColour)
@@ -137,10 +139,12 @@ enum ModelPipeline {
             volume: volume?.volume,
             volumeReliable: volume?.isReliable ?? false,
             volumeOpenness: volume?.openness,
+            volumeMethod: volume?.method,
             texturedShare: textured.hasTexture ? textured.texturedAreaShare : 0,
             materialPreset: options.materialPreset
         )
-        try ModelStore.writeMeta(ModelStore.Meta(stats: stats, material: material), to: folder)
+        try ModelStore.writeMeta(ModelStore.Meta(stats: stats, material: material, name: nil, createdAt: nil, scope: snapshot.scope), to: folder)
+        try? ExportNotes.readme(format: "USDZ").write(to: folder.appendingPathComponent("README.txt"), atomically: true, encoding: .utf8)
         progress("Done", 1)
         return ProcessedModel(folder: folder, stats: stats)
     }

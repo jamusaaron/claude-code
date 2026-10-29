@@ -84,7 +84,7 @@ final class SavedMeasurement {
     }
 
     var csvRow: MeasurementCSVRow {
-        MeasurementCSVRow(name: name, kind: kind, value: value, uncertainty: uncertainty, confidence: confidence,
+        MeasurementCSVRow(id: id, name: name, kind: kind, value: value, uncertainty: uncertainty, confidence: confidence,
                           perimeter: perimeter, height: height, baseArea: baseArea, points: points, createdAt: createdAt, notes: notes)
     }
 }
@@ -154,6 +154,7 @@ struct ModelStats: Codable, Equatable {
     var volume: Double?
     var volumeReliable: Bool
     var volumeOpenness: Double?
+    var volumeMethod: MeshVolumeEstimate.Method?
     var texturedShare: Double
     var materialPreset: MaterialSpec.Preset
 }

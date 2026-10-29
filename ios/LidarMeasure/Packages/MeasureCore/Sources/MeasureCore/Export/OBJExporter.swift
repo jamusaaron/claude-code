@@ -75,6 +75,7 @@ public enum OBJExporter {
         try zip.addFile(name: "\(baseName).obj", contents: files.obj)
         try zip.addFile(name: "\(baseName).mtl", contents: files.mtl)
         if useTexture, let jpeg = textureJPEG { try zip.addFile(name: "texture.jpg", contents: jpeg) }
+        try zip.addFile(name: "README.txt", contents: Data(ExportNotes.readme(format: "OBJ", baseName: baseName).utf8))
         return zip.finalize()
     }
 }

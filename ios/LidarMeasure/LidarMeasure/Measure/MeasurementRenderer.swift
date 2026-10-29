@@ -54,10 +54,21 @@ final class MeasurementRenderer {
 
         labelOverlay.frame = arView.bounds
         labelOverlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        arView.addSubview(labelOverlay)
+        // Below the session host's coaching overlay, which must stay on top.
+        arView.insertSubview(labelOverlay, at: 0)
 
         updateSubscription = arView.scene.subscribe(to: SceneEvents.Update.self) { [weak self] _ in
             self?.perFrame()
+        }
+    }
+
+    /// Measure and Scan share one scene: hide everything when Measure is off screen.
+    func setVisible(_ visible: Bool) {
+        root.isEnabled = visible
+        labelOverlay.isHidden = !visible
+        if !visible {
+            reticle.isEnabled = false
+            edgeGuide.isEnabled = false
         }
     }
 
@@ -269,7 +280,7 @@ final class MeasurementRenderer {
     // MARK: Per-frame
 
     private func perFrame() {
-        guard let arView else { return }
+        guard let arView, root.isEnabled else { return }
         let camera = arView.cameraTransform
         let cameraPosition = camera.translation
         let forward = -SIMD3(camera.matrix.columns.2.x, camera.matrix.columns.2.y, camera.matrix.columns.2.z)

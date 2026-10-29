@@ -2,6 +2,8 @@ import Foundation
 
 /// One saved measurement, flattened for CSV export.
 public struct MeasurementCSVRow: Sendable, Equatable {
+    /// Stable record identifier, so re-exported rows can be de-duplicated in a spreadsheet.
+    public var id: UUID?
     public var name: String
     public var kind: MeasurementKind
     /// SI value: m, m² or m³.
@@ -17,8 +19,9 @@ public struct MeasurementCSVRow: Sendable, Equatable {
     public var createdAt: Date
     public var notes: String
 
-    public init(name: String, kind: MeasurementKind, value: Double, uncertainty: Double, confidence: ConfidenceGrade,
+    public init(id: UUID? = nil, name: String, kind: MeasurementKind, value: Double, uncertainty: Double, confidence: ConfidenceGrade,
                 perimeter: Double? = nil, height: Double? = nil, baseArea: Double? = nil, points: [Vec3], createdAt: Date, notes: String = "") {
+        self.id = id
         self.name = name
         self.kind = kind
         self.value = value
@@ -37,7 +40,7 @@ public struct MeasurementCSVRow: Sendable, Equatable {
 /// spreadsheets parse them; a separate column carries the value as displayed in the app.
 public enum CSVExporter {
     public static let header = [
-        "name", "type", "value", "unit", "uncertainty_1sigma", "display_value", "confidence",
+        "id", "name", "type", "value", "unit", "uncertainty_1sigma", "display_value", "confidence",
         "perimeter_m", "height_m", "base_area_m2", "points_xyz_m", "created_at", "notes",
     ]
 
@@ -45,6 +48,7 @@ public enum CSVExporter {
         var lines: [String] = [header.joined(separator: ",")]
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime]
+        iso.timeZone = TimeZone(secondsFromGMT: 0)
         for r in rows {
             let display: String
             switch r.kind {
@@ -54,6 +58,7 @@ public enum CSVExporter {
             }
             let points = r.points.map { "\(number($0.x));\(number($0.y));\(number($0.z))" }.joined(separator: "|")
             let fields: [String] = [
+                r.id?.uuidString ?? "",
                 r.name,
                 r.kind.rawValue,
                 number(r.value),

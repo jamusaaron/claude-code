@@ -16,26 +16,13 @@ import MeasureCore
 ///  4. World tracking (visual-inertial odometry) places all of that in one metric coordinate
 ///     frame: metres, +Y opposite to gravity.
 enum ARConfigurationFactory {
-    static func measurement() -> ARWorldTrackingConfiguration {
+    /// One configuration shared by Measure and Scan, so switching tabs never re-runs the
+    /// session or moves the world origin: both planes (snapping, capture box placement),
+    /// classified mesh (snapping, capture), and LiDAR depth (smoothed is steadier for picking
+    /// a static point; raw is the fallback).
+    static func shared() -> ARWorldTrackingConfiguration {
         let config = ARWorldTrackingConfiguration()
         config.planeDetection = [.horizontal, .vertical]
-        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
-            config.sceneReconstruction = .mesh
-        }
-        // Smoothed depth is steadier for picking a static point; raw depth is the fallback.
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
-            config.frameSemantics.insert(.smoothedSceneDepth)
-        } else if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-            config.frameSemantics.insert(.sceneDepth)
-        }
-        config.environmentTexturing = .none
-        config.isLightEstimationEnabled = true
-        return config
-    }
-
-    static func capture() -> ARWorldTrackingConfiguration {
-        let config = ARWorldTrackingConfiguration()
-        config.planeDetection = [.horizontal]
         if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
             config.sceneReconstruction = .meshWithClassification
         } else if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
@@ -134,55 +121,64 @@ struct SessionErrorInfo: Identifiable, Equatable {
     }
 }
 
-/// Bridges ARKit's delegate callbacks (delivered on the main queue by default) into a
-/// main-actor-isolated controller without making the controller itself conform to a
-/// non-isolated protocol.
+/// Bridges ARKit's delegate callbacks into the main-actor `ARSessionHost`.
+/// The host sets `session.delegateQueue = .main`, which `assumeIsolated` relies on.
 final class ARSessionDelegateProxy: NSObject, ARSessionDelegate {
-    weak var target: ARSessionEventHandling?
+    weak var host: ARSessionHost?
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        MainActor.assumeIsolated { target?.sessionDidUpdate(frame: frame) }
+        MainActor.assumeIsolated { host?.dispatchFrame(frame) }
     }
 
     func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
-        MainActor.assumeIsolated { target?.sessionDidChange(anchors: anchors, removed: false) }
+        MainActor.assumeIsolated { host?.dispatchAnchors(anchors, removed: false) }
     }
 
     func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
-        MainActor.assumeIsolated { target?.sessionDidChange(anchors: anchors, removed: false) }
+        MainActor.assumeIsolated { host?.dispatchAnchors(anchors, removed: false) }
     }
 
     func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
-        MainActor.assumeIsolated { target?.sessionDidChange(anchors: anchors, removed: true) }
+        MainActor.assumeIsolated { host?.dispatchAnchors(anchors, removed: true) }
     }
 
     func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
         let status = TrackingStatus(camera.trackingState)
-        MainActor.assumeIsolated { target?.sessionTrackingChanged(status) }
+        MainActor.assumeIsolated { host?.dispatchTracking(status) }
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
-        MainActor.assumeIsolated { target?.sessionFailed(error) }
+        MainActor.assumeIsolated { host?.dispatchFailure(error) }
     }
 
     func sessionWasInterrupted(_ session: ARSession) {
-        MainActor.assumeIsolated { target?.sessionInterrupted(true) }
+        MainActor.assumeIsolated { host?.dispatchInterruption(true) }
     }
 
     func sessionInterruptionEnded(_ session: ARSession) {
-        MainActor.assumeIsolated { target?.sessionInterrupted(false) }
+        MainActor.assumeIsolated { host?.dispatchInterruption(false) }
     }
 
     func sessionShouldAttemptRelocalization(_ session: ARSession) -> Bool { true }
 }
 
+/// A mode (Measure or Scan) that uses the shared AR session.
 @MainActor
-protocol ARSessionEventHandling: AnyObject {
+protocol ARModeHandling: AnyObject {
+    /// Per-frame updates, delivered only to the mode on screen.
     func sessionDidUpdate(frame: ARFrame)
+    /// Anchor changes, delivered to every mode so world-space state stays current.
     func sessionDidChange(anchors: [ARAnchor], removed: Bool)
     func sessionTrackingChanged(_ status: TrackingStatus)
     func sessionFailed(_ error: Error)
     func sessionInterrupted(_ interrupted: Bool)
+    /// The mode came on screen / left the screen (the session keeps running between modes).
+    func modeDidActivate()
+    func modeDidDeactivate()
+    /// The camera is about to stop (Library/Settings, background, or the scan is processing).
+    func sessionWillPause()
+    /// Tracking is restarting with a new world origin: drop every world-space coordinate.
+    func worldWillReset()
 }
 
 /// Hosts a controller-owned ARView in SwiftUI. The view outlives SwiftUI updates, so the session

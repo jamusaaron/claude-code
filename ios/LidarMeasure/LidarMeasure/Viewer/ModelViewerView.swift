@@ -92,7 +92,7 @@ struct ModelViewerView: View {
             if let v = s.volume {
                 HStack(spacing: 6) {
                     Text("Volume ≈ \(f.formatVolume(v))").font(.subheadline.monospacedDigit())
-                    Pill(text: s.volumeReliable ? "Closed mesh" : "Mesh has holes", systemImage: nil, color: s.volumeReliable ? Theme.good : Theme.fair)
+                    Pill(text: volumeLabel(s), systemImage: nil, color: s.volumeReliable ? Theme.good : Theme.fair)
                 }
             }
             Text("\(s.triangleCount.formatted()) triangles · \(Int((s.texturedShare * 100).rounded()))% textured")
@@ -102,6 +102,11 @@ struct ModelViewerView: View {
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .hudPlate(highContrast: settings.highContrastHUD)
+    }
+
+    private func volumeLabel(_ s: ModelStats) -> String {
+        guard s.volumeReliable else { return "Mesh has holes: approximate" }
+        return s.volumeMethod == .closedMesh ? "Closed mesh" : "Closed above base"
     }
 
     private var controls: some View {

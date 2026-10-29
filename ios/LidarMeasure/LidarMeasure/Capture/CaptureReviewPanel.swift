@@ -22,6 +22,12 @@ struct CaptureReviewPanel: View {
                     .foregroundStyle(.secondary)
             }
 
+            if controller.keyframeCount == 0 {
+                Label("No camera views were captured, so the model can't be textured. For colour, scan more slowly in good light.", systemImage: "camera.metering.unknown")
+                    .font(.caption)
+                    .foregroundStyle(Theme.fair)
+            }
+
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     cleanupSection
@@ -98,7 +104,9 @@ struct CaptureReviewPanel: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Appearance").font(.subheadline.weight(.bold))
             Picker("Material", selection: $controller.options.materialPreset) {
-                ForEach(MaterialSpec.Preset.allCases) { Text($0.title).tag($0) }
+                ForEach(MaterialSpec.Preset.allCases.filter { $0 != .capturedTexture || controller.keyframeCount > 0 }) {
+                    Text($0.title).tag($0)
+                }
             }
             .pickerStyle(.menu)
             .tint(Theme.accent)

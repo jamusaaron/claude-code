@@ -2,24 +2,23 @@ import SwiftUI
 import SwiftData
 import MeasureCore
 
-/// 3D capture screen: choose what to scan, scan it, clean it up, preview and save.
+/// 3D capture tools drawn over the shared camera: choose what to scan, scan it, clean it up,
+/// preview and save.
 struct ModelCaptureView: View {
-    var isActive: Bool
+    @ObservedObject var controller: CaptureController
+    /// Points of the latest Measure result (same world), for fitting the capture box.
+    var lastMeasurementPoints: [SIMD3<Float>]?
 
     @EnvironmentObject private var settings: AppSettings
     @Environment(\.modelContext) private var modelContext
-    @StateObject private var controller = CaptureController()
     @State private var saveName = ""
     @State private var showSaveAlert = false
     @State private var confirmDiscard = false
 
     var body: some View {
         ZStack {
-            ARViewContainer(arView: controller.arView)
-                .ignoresSafeArea()
-
             if dimsCamera {
-                Color.black.opacity(0.75).ignoresSafeArea()
+                Color.black.opacity(0.75).ignoresSafeArea(edges: .top)
             }
 
             VStack(spacing: 10) {
@@ -40,14 +39,7 @@ struct ModelCaptureView: View {
             .padding(.horizontal, 12)
             .padding(.bottom, 8)
         }
-        .onAppear {
-            controller.attach(settings: settings)
-            if isActive { controller.start() }
-        }
-        .onDisappear { controller.pause() }
-        .onChange(of: isActive) { _, nowActive in
-            if nowActive { controller.start() } else { controller.pause() }
-        }
+        .onAppear { controller.attach(settings: settings) }
         .fullScreenCover(isPresented: Binding(get: { controller.phase == .preview && controller.processed != nil }, set: { _ in })) {
             previewScreen
         }
@@ -121,6 +113,16 @@ struct ModelCaptureView: View {
                         .font(.subheadline)
                 } else {
                     regionSliders
+                }
+                if let points = lastMeasurementPoints {
+                    Button {
+                        controller.fitRegion(to: points)
+                    } label: {
+                        Label("Fit box to last measurement", systemImage: "cube.transparent")
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(Theme.accent)
                 }
             } else {
                 Label("Captures everything the LiDAR sees, up to about 5 m. Best for rooms and large surfaces.", systemImage: "camera.metering.matrix")

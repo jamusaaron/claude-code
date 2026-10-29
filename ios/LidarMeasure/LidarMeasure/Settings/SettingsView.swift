@@ -3,10 +3,14 @@ import SwiftData
 import MeasureCore
 
 struct SettingsView: View {
+    /// Restarts tracking with a new world origin (clears on-screen points and any unfinished scan).
+    var onRestartTracking: () -> Void = {}
+
     @EnvironmentObject private var settings: AppSettings
     @Environment(\.modelContext) private var modelContext
     @State private var storageBytes: Int64 = 0
     @State private var confirmDeleteAll = false
+    @State private var confirmRestart = false
 
     var body: some View {
         NavigationStack {
@@ -63,6 +67,15 @@ struct SettingsView: View {
                     Text("Large scans need more memory and processing time. Scans stop automatically above the limit or if iOS reports low memory.")
                 }
 
+                Section {
+                    Button("Restart tracking", role: .destructive) { confirmRestart = true }
+                        .disabled(!DeviceCapabilities.hasLiDAR)
+                } header: {
+                    Text("AR session")
+                } footer: {
+                    Text("Use after an interruption or obvious drift. Points on the Measure screen are cleared; saved items are kept.")
+                }
+
                 Section("About accuracy") {
                     NavigationLink("How accurate is phone LiDAR?") { AccuracyInfoView() }
                 }
@@ -94,6 +107,11 @@ struct SettingsView: View {
             }
             .navigationTitle("Settings")
             .onAppear(perform: refreshStorage)
+            .confirmationDialog("Restart tracking?", isPresented: $confirmRestart, titleVisibility: .visible) {
+                Button("Restart", role: .destructive) { onRestartTracking() }
+            } message: {
+                Text("Starts a new coordinate system. On-screen points and an unfinished scan can't carry over.")
+            }
             .confirmationDialog("Delete everything?", isPresented: $confirmDeleteAll, titleVisibility: .visible) {
                 Button("Delete all", role: .destructive) { deleteEverything() }
             } message: {

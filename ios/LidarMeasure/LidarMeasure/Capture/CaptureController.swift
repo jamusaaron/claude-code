@@ -25,7 +25,7 @@ struct PipelineProgress: Equatable {
 
 /// Drives a 3D capture: choose scope → (place box) → scan → review options → process → save.
 @MainActor
-final class CaptureController: NSObject, ObservableObject, ARSessionEventHandling {
+final class CaptureController: NSObject, ObservableObject, ARModeHandling {
     enum Phase: Equatable {
         case setup
         case scanning
@@ -52,14 +52,13 @@ final class CaptureController: NSObject, ObservableObject, ARSessionEventHandlin
     @Published var options = ProcessingOptions()
     @Published var toast: String?
 
-    let arView: ARView
+    let host: ARSessionHost
+    var arView: ARView { host.arView }
 
     // MARK: Private
 
-    private let delegateProxy = ARSessionDelegateProxy()
     private let monitor = EnvironmentMonitor()
     private let regionEntity = RegionBoxEntity()
-    private let coaching = ARCoachingOverlayView()
     private weak var settings: AppSettings?
     private var recorder: KeyframeRecorder?
     private var snapshot: CaptureSnapshot?
@@ -67,30 +66,22 @@ final class CaptureController: NSObject, ObservableObject, ARSessionEventHandlin
     private var statsTimer: Timer?
     private var processingTask: Task<Void, Never>?
     private var frameCounter = 0
-    private var isRunning = false
     private var memoryObserver: NSObjectProtocol?
 
-    override init() {
-        arView = ARConfigurationFactory.makeARView()
+    init(host: ARSessionHost) {
+        self.host = host
         super.init()
-        delegateProxy.target = self
-        arView.session.delegate = delegateProxy
-        arView.scene.addAnchor(regionEntity.anchor)
-
-        coaching.session = arView.session
-        coaching.goal = .horizontalPlane
-        coaching.activatesAutomatically = true
-        coaching.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        coaching.frame = arView.bounds
-        arView.addSubview(coaching)
+        host.arView.scene.addAnchor(regionEntity.anchor)
 
         let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
-        arView.addGestureRecognizer(tap)
+        host.arView.addGestureRecognizer(tap)
 
         memoryObserver = NotificationCenter.default.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.handleMemoryWarning() }
         }
     }
+
+    private var isOnScreen: Bool { host.activeMode == .capture }
 
     func attach(settings: AppSettings) {
         self.settings = settings
@@ -98,48 +89,47 @@ final class CaptureController: NSObject, ObservableObject, ARSessionEventHandlin
         options.simplifyCentimetres = settings.defaultSimplifyCentimetres
     }
 
-    // MARK: Session
+    // MARK: ARModeHandling
 
-    func start() {
-        guard !isRunning, DeviceCapabilities.hasLiDAR else { return }
+    func modeDidActivate() {
+        // The live wireframe shows what the LiDAR has reconstructed so far.
+        arView.debugOptions.insert(.showSceneUnderstanding)
+        arView.environment.sceneUnderstanding.options = []
+        regionChanged()
+        // Reviewing or processing a capture doesn't need the camera.
         switch phase {
-        case .setup, .scanning:
-            runSession(reset: !hasRunOnce)
-        default:
-            break // reviewing/processing: keep the session paused
+        case .review, .processing, .preview, .extracting: host.suspend()
+        default: break
         }
     }
 
-    private var hasRunOnce = false
-
-    private func runSession(reset: Bool) {
-        let options: ARSession.RunOptions = reset ? [.resetTracking, .removeExistingAnchors, .resetSceneReconstruction] : []
-        arView.session.run(ARConfigurationFactory.capture(), options: options)
-        // The live wireframe shows what the LiDAR has reconstructed so far.
-        arView.debugOptions.insert(.showSceneUnderstanding)
-        hasRunOnce = true
-        isRunning = true
-        UIApplication.shared.isIdleTimerDisabled = true
+    func modeDidDeactivate() {
+        regionEntity.update(nil)
+        // Leaving mid-scan freezes what was captured rather than recording an unseen screen.
+        if phase == .scanning { stopScan() }
     }
 
-    func pause() {
-        guard isRunning else { return }
-        if phase == .scanning { stopScanTimer() }
-        arView.session.pause()
-        isRunning = false
-        UIApplication.shared.isIdleTimerDisabled = false
+    func sessionWillPause() {
+        // A paused session may resume in a different world origin: never append to a scan
+        // across a pause. Freeze what we have; the user can still process and export it.
+        if phase == .scanning { stopScan() }
     }
 
-    /// Throws away the reconstructed mesh so far (e.g. after moving to a new spot).
-    func resetMesh() {
+    func worldWillReset() {
+        if phase == .scanning { stopScan() }
+        // The capture box was placed in the old world.
         regionBase = nil
         regionChanged()
         monitor.reset()
-        runSession(reset: true)
-        Haptics.tick()
     }
 
-    // MARK: ARSessionEventHandling
+    /// Throws away the reconstructed mesh so far but keeps the world origin, so the capture
+    /// box and any on-screen measurements stay where they are.
+    func resetMesh() {
+        monitor.reset()
+        host.resetReconstruction()
+        Haptics.tick()
+    }
 
     func sessionDidUpdate(frame: ARFrame) {
         frameCounter &+= 1
@@ -157,14 +147,18 @@ final class CaptureController: NSObject, ObservableObject, ARSessionEventHandlin
     func sessionTrackingChanged(_ status: TrackingStatus) { tracking = status }
 
     func sessionFailed(_ error: Error) {
-        isRunning = false
-        if phase == .scanning { stopScanTimer() }
+        if phase == .scanning { stopScan() }
         sessionError = SessionErrorInfo(error)
         Haptics.error()
     }
 
     func sessionInterrupted(_ interrupted: Bool) {
         if interrupted {
+            // Freeze immediately: after an interruption ARKit may relocalise into a shifted world.
+            if phase == .scanning {
+                stopScan()
+                showToast("Scan stopped by an interruption. What was captured is kept.")
+            }
             monitor.externalFlags.insert(.interrupted)
         } else {
             Task { [weak self] in
@@ -182,12 +176,27 @@ final class CaptureController: NSObject, ObservableObject, ARSessionEventHandlin
     }
 
     private func regionChanged() {
-        regionEntity.update(region)
-        coaching.goal = scope == .object ? .horizontalPlane : .tracking
+        regionEntity.update(isOnScreen ? region : nil)
+    }
+
+    /// Fits the capture box around measured points (same world: Measure and Scan share one
+    /// session). Gravity-aligned and padded; the base sits on the lowest point.
+    func fitRegion(to points: [SIMD3<Float>], padding: Float = 0.05) {
+        guard points.count >= 2, var lo = points.first else { return }
+        var hi = lo
+        for p in points { lo = simd_min(lo, p); hi = simd_max(hi, p) }
+        let size = SIMD3<Float>(max(0.1, hi.x - lo.x + 2 * padding), max(0.1, hi.y - lo.y + padding), max(0.1, hi.z - lo.z + 2 * padding))
+        scope = .object
+        regionYaw = 0
+        regionSize = simd_min(size, SIMD3(repeating: 3))
+        regionBase = SIMD3((lo.x + hi.x) / 2, lo.y, (lo.z + hi.z) / 2)
+        regionChanged()
+        Haptics.pointPlaced()
+        showToast("Capture box fitted to your last measurement.")
     }
 
     @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
-        guard phase == .setup, scope == .object, gesture.state == .ended else { return }
+        guard isOnScreen, phase == .setup, scope == .object, gesture.state == .ended else { return }
         let point = gesture.location(in: arView)
         let hit = arView.raycast(from: point, allowing: .existingPlaneGeometry, alignment: .horizontal).first
             ?? arView.raycast(from: point, allowing: .estimatedPlane, alignment: .horizontal).first
@@ -278,10 +287,9 @@ final class CaptureController: NSObject, ObservableObject, ARSessionEventHandlin
         let captureScope = self.scope
         let keyframes = recorder?.records ?? []
         let directory = recorder?.directory ?? ModelStore.temporaryRoot
-        // Freeze the session: the anchors we hold keep their buffers alive while we copy.
-        arView.session.pause()
-        isRunning = false
-        UIApplication.shared.isIdleTimerDisabled = false
+        // The anchors we hold keep their Metal buffers alive while we copy them off the main
+        // thread, so the camera can stop now.
+        host.suspend()
 
         // Strong capture: the controller is main-actor isolated (Sendable) and outlives this task.
         Task.detached(priority: .userInitiated) { [self] in
@@ -295,6 +303,11 @@ final class CaptureController: NSObject, ObservableObject, ARSessionEventHandlin
                     self.snapshot = snapshot
                     self.options.removeSupportSurface = captureScope == .object
                     self.options.cropToRegion = captureScope == .object
+                    // No camera views means no texture: say so and default to a plain material
+                    // rather than export an all-grey "textured" model.
+                    if keyframes.isEmpty && self.options.materialPreset == .capturedTexture {
+                        self.options.materialPreset = .clay
+                    }
                     self.phase = .review
                     Haptics.success()
                 }
@@ -365,8 +378,13 @@ final class CaptureController: NSObject, ObservableObject, ARSessionEventHandlin
         guard let processed else { return false }
         let id = UUID()
         do {
+            let created = Date()
+            let captureScope = snapshot?.scope ?? scope
+            // Name the bundle before committing it, so a crash after the move still leaves a
+            // folder the library can recover by itself.
+            ModelStore.finalise(folder: processed.folder, name: name, createdAt: created, scope: captureScope)
             let folderName = try ModelStore.adopt(temporaryFolder: processed.folder, id: id)
-            let record = SavedModel(id: id, name: name, createdAt: Date(), folderName: folderName, stats: processed.stats, scope: snapshot?.scope ?? scope)
+            let record = SavedModel(id: id, name: name, createdAt: created, folderName: folderName, stats: processed.stats, scope: captureScope)
             context.insert(record)
             try context.save()
         } catch {
@@ -403,7 +421,10 @@ final class CaptureController: NSObject, ObservableObject, ARSessionEventHandlin
         phase = .setup
         regionChanged()
         monitor.reset()
-        runSession(reset: true)
+        // Camera back on with a fresh mesh for the next scan. The world origin is kept, so
+        // measurements on the Measure screen stay valid.
+        host.resume()
+        host.resetReconstruction()
     }
 
     // MARK: Toast

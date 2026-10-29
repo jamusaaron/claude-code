@@ -1,4 +1,5 @@
 import Foundation
+import SwiftData
 import MeasureCore
 
 /// File layout for captured models. Each model is a folder:
@@ -18,9 +19,14 @@ enum ModelStore {
     static let thumbnailFile = "thumbnail.jpg"
     static let metaFile = "meta.json"
 
+    /// `meta.json`: everything needed to rebuild the library record from the folder alone,
+    /// so a model survives the app being killed between writing files and saving the record.
     struct Meta: Codable {
         var stats: ModelStats
         var material: MaterialSpec
+        var name: String?
+        var createdAt: Date?
+        var scope: CaptureScope?
     }
 
     enum StoreError: LocalizedError {
@@ -82,6 +88,50 @@ enum ModelStore {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(meta).write(to: folder.appendingPathComponent(metaFile), options: .atomic)
+    }
+
+    /// Records the final name and date in `meta.json` once a model is saved.
+    static func finalise(folder: URL, name: String, createdAt: Date, scope: CaptureScope) {
+        guard var meta = readMeta(folder) else { return }
+        meta.name = name
+        meta.createdAt = createdAt
+        meta.scope = scope
+        try? writeMeta(meta, to: folder)
+    }
+
+    // MARK: Recovery
+
+    struct ReconcileResult {
+        var recovered = 0
+        var missing: [SavedModel] = []
+    }
+
+    /// Re-registers model folders that have no library record (e.g. the app was killed right
+    /// after the files were committed) and reports records whose files are gone.
+    @MainActor
+    static func reconcile(known: [SavedModel], context: ModelContext) -> ReconcileResult {
+        var result = ReconcileResult()
+        let fm = FileManager.default
+        let knownFolders = Set(known.map(\.folderName))
+        let folders = (try? fm.contentsOfDirectory(at: rootDirectory, includingPropertiesForKeys: [.isDirectoryKey, .creationDateKey], options: [.skipsHiddenFiles])) ?? []
+        for folder in folders where !knownFolders.contains(folder.lastPathComponent) {
+            guard fm.fileExists(atPath: folder.appendingPathComponent(usdzFile).path),
+                  let meta = readMeta(folder) else { continue }
+            let created = meta.createdAt ?? (try? folder.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
+            let record = SavedModel(
+                id: UUID(uuidString: folder.lastPathComponent) ?? UUID(),
+                name: meta.name ?? "Recovered scan",
+                createdAt: created,
+                folderName: folder.lastPathComponent,
+                stats: meta.stats,
+                scope: meta.scope ?? .scene
+            )
+            context.insert(record)
+            result.recovered += 1
+        }
+        if result.recovered > 0 { try? context.save() }
+        result.missing = known.filter { !fm.fileExists(atPath: $0.folderURL.appendingPathComponent(usdzFile).path) }
+        return result
     }
 
     // MARK: Exports
